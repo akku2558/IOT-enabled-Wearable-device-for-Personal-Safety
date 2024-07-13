@@ -8,12 +8,12 @@
 #include "driver/rtc_io.h"
 #include <LittleFS.h>
 #include <FS.h>
-#include <WiFi.h>
+// #include <WiFi.h>
 
 #include <addons/TokenHelper.h>  //Provide the token generation process info.
 
-const char *ssid = "Galaxy M32 5GAFEE";
-const char *password = "tyyb1208";
+// const char *ssid = "Galaxy M32 5GAFEE";
+// const char *password = "tyyb1208";
 
 #define gpsRX 12
 #define gpsTX 14
@@ -22,13 +22,25 @@ const char *password = "tyyb1208";
 #define pushButton 0
 #define buzzer 2
 #define googleMapsUrl "Current Location https://www.google.com/maps/search/?api=1&query="
+
+// Your GPRS credentials, if any
+const char apn[] = "uk.lebara.mobi";
+const char gprsUser[] = "wap";
+const char gprsPass[] = "wap";
 //Select camera model
 #define CAMERA_MODEL_WROVER_KIT  // Has PSRAM 
 #include "camera_pins.h"
 
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+
+
+
 TinyGPS gps;
 SoftwareSerial gpsSerial(gpsRX, gpsTX);
 SoftwareSerial gsmSerial(gsmRX, gsmTX);
+
+TinyGsm        modem(gsmSerial);
 
 bool newData = false;
 String locationUrl;
@@ -46,7 +58,6 @@ const char *filename = "/picture.jpg";
 #define STORAGE_BUCKET_ID "iot-wearable-device-babdb.appspot.com"
 
 // Photo File Name to save in LittleFS
-#define FILE_PHOTO_PATH "/photo.jpg"
 #define BUCKET_PHOTO "/data/photo.jpg"
 
 void startCameraServer();
@@ -58,9 +69,12 @@ FirebaseConfig fconfig;
 void fcsUploadCallback(FCS_UploadStatusInfo info);
 
 bool taskCompleted = false;
+int photoCount = 1;
+#define FILE_PHOTO_PATH "/photo_" + String(photoCount) + ".jpg"
 
 void uploadToFirebase(){
   // if (Firebase.ready() && !taskCompleted) {
+    if(!taskCompleted){
         taskCompleted = true;
         Serial.print("Uploading picture... ");
 
@@ -71,7 +85,9 @@ void uploadToFirebase(){
         } else {
           Serial.println(fbdo.errorReason());
         }
-      // }
+        photoCount++;
+        taskCompleted = false;
+      }
 }
 
 // Capture Photo and Save it to LittleFS
@@ -81,7 +97,6 @@ void capturePhotoSaveLittleFS(void) {
   // Skip first 3 frames (increase/decrease number as needed).
   for (int i = 0; i < 4; i++) {
     fb = esp_camera_fb_get();
-    uploadToFirebase();
     esp_camera_fb_return(fb);
     fb = NULL;
   }
@@ -89,6 +104,7 @@ void capturePhotoSaveLittleFS(void) {
   // Take a new photo
   fb = NULL;
   fb = esp_camera_fb_get();
+  uploadToFirebase();
   if (!fb) {
     Serial.println("Camera capture failed");
     delay(1000);
@@ -205,30 +221,47 @@ void cameraInit(){
 
 void setup() {
   Serial.begin(115200);
-  //setup wifi
-   WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+  // //setup wifi
+  //  WiFi.begin(ssid, password);
+  // WiFi.setSleep(false);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.println("WiFi connected"); 
+  // while (WiFi.status() != WL_CONNECTED) {
+  //   delay(500);
+  //   Serial.print(".");
+  // }
+  // Serial.println("");
+  // Serial.println("WiFi connected"); 
 
   //Begin serial communication with Neo-7M
   gpsSerial.begin(9600);
   initGPS();
 
+
   //Begin serial communication with SIM800L
   gsmSerial.begin(9600);
+  modem.init();
+
+   if (!modem.waitForNetwork(600000L, true)) {
+    delay(1000);
+    return;
+  }
+
+  if (modem.isNetworkConnected()) { Serial.println("Network connected"); }
+  modem.gprsConnect(apn, gprsUser, gprsPass);
+
+  if(modem.isGprsConnected()) {
+    Serial.println("GPRS connected");
+  }
+
+  //  bool res = modem.isGprsConnected();
+  // Serial.println("GPRS status:", res ? "connected" : "not connected");
 
   cameraInit();
 
    // Configure Firebase
   fconfig.host = FIREBASE_HOST;
   fconfig.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.reconnectWiFi(true);
+  // Firebase.reconnectNetwork(true);
   fbdo.setResponseSize(512);
   Firebase.begin(&fconfig, &auth);
   Serial.println("Firebase connected successful........");
@@ -242,17 +275,17 @@ void setup() {
   //configure buzzer pin as output
   pinMode(buzzer, OUTPUT);
 
-  gsmSerial.println("AT");
-  waitForResponse(2000);
+  // gsmSerial.println("AT");
+  // waitForResponse(2000);
 
-  gsmSerial.println("ATE1");
-  waitForResponse(2000);
+  // gsmSerial.println("ATE1");
+  // waitForResponse(2000);
 
-  gsmSerial.println("AT+CMGF=1");
-  waitForResponse(2000);
+  // gsmSerial.println("AT+CMGF=1");
+  // waitForResponse(2000);
 
-  gsmSerial.println("AT+CNMI=1,2,0,0,0");
-  waitForResponse(2000);
+  // gsmSerial.println("AT+CNMI=1,2,0,0,0");
+  // waitForResponse(2000);
 
 }
 
@@ -273,12 +306,13 @@ void loop() {
 }
 
 void send_sms() {
-  gsmSerial.print("AT+CMGS=\"+447741875858\"\r");
-  waitForResponse(1000);
+  // gsmSerial.print("AT+CMGS=\"+447741875858\"\r");
+  // waitForResponse(1000);
 
-  gsmSerial.print(locationUrl);
-  gsmSerial.write(0x1A);
-  waitForResponse(1000);
+  // gsmSerial.print(locationUrl);
+  // gsmSerial.write(0x1A);
+  // waitForResponse(1000);
+  modem.sendSMS("+447741875858", locationUrl);
 }
 
 
@@ -305,6 +339,7 @@ void initGPS() {
     }
 
     if (newData) {
+      Serial.println("GPS connected.......");
       gps.f_get_position(&flat, &flon, &age);
       locationUrl = googleMapsUrl + String(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6) + "%2C" + String(flon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flon, 6);
       break;
