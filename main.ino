@@ -1,19 +1,13 @@
 #include <SoftwareSerial.h>
 #include <TinyGPS.h>
-#include <ArduinoJson.h>            // https://github.com/bblanchon/ArduinoJson 
-#include <Firebase_ESP_Client.h>
+#include <ArduinoJson.h>
+#include <FirebaseClient.h>
 #include "esp_camera.h"
 #include "soc/soc.h"           // Disable brownout problems
 #include "soc/rtc_cntl_reg.h"  // Disable brownout problems
 #include "driver/rtc_io.h"
 #include <LittleFS.h>
 #include <FS.h>
-// #include <WiFi.h>
-
-#include <addons/TokenHelper.h>  //Provide the token generation process info.
-
-// const char *ssid = "Galaxy M32 5GAFEE";
-// const char *password = "tyyb1208";
 
 #define gpsRX 12
 #define gpsTX 14
@@ -22,73 +16,80 @@
 #define pushButton 0
 #define buzzer 2
 #define googleMapsUrl "Current Location https://www.google.com/maps/search/?api=1&query="
+String SMS_TARGETS[5] = { "+44XXXXXXXXXX", "+44XXXXXXXXXX" };
 
-// Your GPRS credentials, if any
-const char apn[] = "uk.lebara.mobi";
-const char gprsUser[] = "wap";
-const char gprsPass[] = "wap";
+
 //Select camera model
-#define CAMERA_MODEL_WROVER_KIT  // Has PSRAM 
+#define CAMERA_MODEL_WROVER_KIT  // Has PSRAM
 #include "camera_pins.h"
 
-#define TINY_GSM_MODEM_SIM800
-#include <TinyGsmClient.h>
+#define TINY_GSM_MODEM_SIM900
+#include <TinyGSM.h>
 
-
+#define TINY_GSM_USE_GPRS true
 
 TinyGPS gps;
 SoftwareSerial gpsSerial(gpsRX, gpsTX);
 SoftwareSerial gsmSerial(gsmRX, gsmTX);
 
-TinyGsm        modem(gsmSerial);
+#define DUMP_AT_COMMANDS
+
+#ifdef DUMP_AT_COMMANDS
+#include <StreamDebugger.h>
+StreamDebugger debugger(gsmSerial, Serial);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(gsmSerial);
+#endif
+
+TinyGsmClient gsmClient(modem);
+
+// Your GPRS credentials, if any
+#define GSM_PIN ""
+const char apn[] = "uk.lebara.mobi";
+const char gprsUser[] = "wap";
+const char gprsPass[] = "wap";
 
 bool newData = false;
 String locationUrl;
 float flat, flon;
 unsigned long age;
-const char *filename = "/picture.jpg";
+bool taskCompleted = false;
+#define FILE_PHOTO_PATH "/photo.jpg"
+
 
 // Replace with your Firebase project credentials
 #define FIREBASE_HOST "https://iot-wearable-device-babdb-default-rtdb.firebaseio.com"
 #define FIREBASE_AUTH "dMGqdcWtp6ShZQLhtqe8WBwFru8kptTVDklYsfMb"
-// #define REFERENCE_URL "gs://iot-wearable-device-babdb.appspot.com"  // Your Firebase project reference url
-// Insert Firebase project API Key
 #define API_KEY "AIzaSyDhJCj-dkcY9Z_EGAtFzdRnmq2237iufPc"
-#define USER_EMAIL "firebase-adminsdk-4t8f4@iot-wearable-device-babdb.iam.gserviceaccount.com"
 #define STORAGE_BUCKET_ID "iot-wearable-device-babdb.appspot.com"
 
-// Photo File Name to save in LittleFS
-#define BUCKET_PHOTO "/data/photo.jpg"
+ESP_SSLClient sslClient;
+
+GSMNetwork gsmNetwork(&modem, GSM_PIN, apn, gprsUser, gprsPass);
+
+NoAuth noAuth;
+
+FirebaseApp app;
+
+using AsyncClient = AsyncClientClass;
+
+AsyncClient aClient(sslClient, getNetwork(gsmNetwork));
+
+Storage storage;
+
+void asyncCB(AsyncResult &aResult);
+
+void printResult(AsyncResult &aResult);
 
 void startCameraServer();
 
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig fconfig;
+void sendSms(String messageToBeSent);
 
-void fcsUploadCallback(FCS_UploadStatusInfo info);
+void fileCallback(File &file, const char *filename, file_operating_mode mode);
 
-bool taskCompleted = false;
-int photoCount = 1;
-#define FILE_PHOTO_PATH "/photo_" + String(photoCount) + ".jpg"
+FileConfig media_file("/photo.jpg", fileCallback);
 
-void uploadToFirebase(){
-  // if (Firebase.ready() && !taskCompleted) {
-    if(!taskCompleted){
-        taskCompleted = true;
-        Serial.print("Uploading picture... ");
-
-        //MIME type should be valid to avoid the download problem.
-        //The file systems for flash and SD/SDMMC can be changed in FirebaseFS.h.
-        if (Firebase.Storage.upload(&fbdo, STORAGE_BUCKET_ID /* Firebase Storage bucket id */, FILE_PHOTO_PATH /* path to local file */, mem_storage_type_flash /* memory storage type, mem_storage_type_flash and mem_storage_type_sd */, BUCKET_PHOTO /* path of remote file stored in the bucket */, "image/jpeg" /* mime type */, fcsUploadCallback)) {
-          Serial.printf("\nDownload URL: %s\n", fbdo.downloadURL().c_str());
-        } else {
-          Serial.println(fbdo.errorReason());
-        }
-        photoCount++;
-        taskCompleted = false;
-      }
-}
 
 // Capture Photo and Save it to LittleFS
 void capturePhotoSaveLittleFS(void) {
@@ -104,15 +105,12 @@ void capturePhotoSaveLittleFS(void) {
   // Take a new photo
   fb = NULL;
   fb = esp_camera_fb_get();
-  uploadToFirebase();
   if (!fb) {
     Serial.println("Camera capture failed");
     delay(1000);
-    // ESP.restart();
   }
 
-  // Photo file name
-  Serial.printf("Picture file name: %s\n", FILE_PHOTO_PATH);
+  // temporarily saving the image
   File file = LittleFS.open(FILE_PHOTO_PATH, FILE_WRITE);
 
   // Insert the data in the photo file
@@ -125,6 +123,7 @@ void capturePhotoSaveLittleFS(void) {
     Serial.print(" - Size: ");
     Serial.print(fb->len);
     Serial.println(" bytes");
+    uploadToFirebase();
   }
   // Close the file
   file.close();
@@ -134,16 +133,16 @@ void capturePhotoSaveLittleFS(void) {
 void initLittleFS() {
   if (!LittleFS.begin(true)) {
     Serial.println("An Error has occurred while mounting LittleFS");
-    // ESP.restart();
+    return;
   } else {
     delay(500);
     Serial.println("LittleFS mounted successfully \n");
   }
 }
 
-void cameraInit(){
+void cameraInit() {
 
-   // Turn-off the 'brownout detector'
+  // Turn-off the 'brownout detector'
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   camera_config_t config;
@@ -215,112 +214,70 @@ void cameraInit(){
   if (config.pixel_format == PIXFORMAT_JPEG) {
     s->set_framesize(s, FRAMESIZE_QVGA);
   }
-
 }
-
 
 void setup() {
   Serial.begin(115200);
-  // //setup wifi
-  //  WiFi.begin(ssid, password);
-  // WiFi.setSleep(false);
 
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   delay(500);
-  //   Serial.print(".");
-  // }
-  // Serial.println("");
-  // Serial.println("WiFi connected"); 
+  Serial.println("Initializing..........................................................");
 
   //Begin serial communication with Neo-7M
   gpsSerial.begin(9600);
   initGPS();
 
 
-  //Begin serial communication with SIM800L
+  //Begin serial communication with SIM900A
   gsmSerial.begin(9600);
-  modem.init();
-
-   if (!modem.waitForNetwork(600000L, true)) {
-    delay(1000);
-    return;
-  }
-
-  if (modem.isNetworkConnected()) { Serial.println("Network connected"); }
-  modem.gprsConnect(apn, gprsUser, gprsPass);
-
-  if(modem.isGprsConnected()) {
-    Serial.println("GPRS connected");
-  }
-
-  //  bool res = modem.isGprsConnected();
-  // Serial.println("GPRS status:", res ? "connected" : "not connected");
-
+  initGSM();
+  
   cameraInit();
 
-   // Configure Firebase
-  fconfig.host = FIREBASE_HOST;
-  fconfig.signer.tokens.legacy_token = FIREBASE_AUTH;
-  // Firebase.reconnectNetwork(true);
-  fbdo.setResponseSize(512);
-  Firebase.begin(&fconfig, &auth);
-  Serial.println("Firebase connected successful........");
+  //Configure Firebase
+  initializeApp(aClient, app, getAuth(noAuth), asyncCB, "authTask");
 
+  app.getApp<Storage>(storage);
+
+  //Initialize LittleFS
   initLittleFS();
 
- 
   // Configure button pin as input
   pinMode(pushButton, INPUT_PULLUP);
 
   //configure buzzer pin as output
   pinMode(buzzer, OUTPUT);
-
-  // gsmSerial.println("AT");
-  // waitForResponse(2000);
-
-  // gsmSerial.println("ATE1");
-  // waitForResponse(2000);
-
-  // gsmSerial.println("AT+CMGF=1");
-  // waitForResponse(2000);
-
-  // gsmSerial.println("AT+CNMI=1,2,0,0,0");
-  // waitForResponse(2000);
-
 }
 
 void loop() {
 
+  app.loop();
+
+  storage.loop();
+  //checking if button is pressed
   if (digitalRead(pushButton) == LOW) {
+    delay(10);
     digitalWrite(buzzer, HIGH);
-    send_sms();
+    sendSms(locationUrl);
     digitalWrite(buzzer, LOW);
     capturePhotoSaveLittleFS();
-    
   }
-
+  //updating location coordinates
   gps.f_get_position(&flat, &flon, &age);
   locationUrl = googleMapsUrl + String(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6) + "%2C" + String(flon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flon, 6);
-
-
-}
-
-void send_sms() {
-  // gsmSerial.print("AT+CMGS=\"+447741875858\"\r");
-  // waitForResponse(1000);
-
-  // gsmSerial.print(locationUrl);
-  // gsmSerial.write(0x1A);
-  // waitForResponse(1000);
-  modem.sendSMS("+447741875858", locationUrl);
 }
 
 
-// void make_call(){
-//   simSerial.println("ATD+447741875858;");
-//   waitForResponse(2000);
-// }
+//for sending sms to the emergency contacts
+void sendSms(String messageToBeSent) {
+  for (int i = 0; i < 5; i++) {
+    if (SMS_TARGETS[i] != "") {
+      modem.sendSMS(SMS_TARGETS[i], messageToBeSent);
+      Serial.print("SMS sent to ");
+      Serial.println(SMS_TARGETS[i]);
+    }
+  }
+}
 
+//receiving response from GSM
 void waitForResponse(int delaytime) {
   delay(delaytime);
   while (gsmSerial.available()) {
@@ -330,16 +287,17 @@ void waitForResponse(int delaytime) {
 }
 
 void initGPS() {
-  
   while (1) {
     while (gpsSerial.available()) {
       char c = gpsSerial.read();
-      if (gps.encode(c))  // Did a new valid sentence come in?
+      Serial.write(c);
+      if (gps.encode(c)) {
         newData = true;
+      }
     }
 
     if (newData) {
-      Serial.println("GPS connected.......");
+      Serial.println("\nGPS connected.......");
       gps.f_get_position(&flat, &flon, &age);
       locationUrl = googleMapsUrl + String(flat == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flat, 6) + "%2C" + String(flon == TinyGPS::GPS_INVALID_F_ANGLE ? 0.0 : flon, 6);
       break;
@@ -347,31 +305,126 @@ void initGPS() {
   }
 }
 
-// The Firebase Storage upload callback function
-void fcsUploadCallback(FCS_UploadStatusInfo info){
-    if (info.status == firebase_fcs_upload_status_init){
-        Serial.printf("Uploading file %s (%d) to %s\n", info.localFileName.c_str(), info.fileSize, info.remoteFileName.c_str());
-    }
-    else if (info.status == firebase_fcs_upload_status_upload)
+void initGSM() {
+  modem.init();
+
+  if (!modem.waitForNetwork(600000L, true)) {
+    delay(1000);
+    return;
+  }
+
+  if (modem.isNetworkConnected()) { Serial.println("Network connected"); }
+  modem.gprsConnect(apn, gprsUser, gprsPass);
+
+  if (modem.isGprsConnected()) {
+    Serial.println("GPRS connected");
+  }
+
+  sslClient.setInsecure();
+
+  sslClient.setDebugLevel(1);
+
+  sslClient.setBufferSizes(2048 /* rx */, 1024 /* tx */);
+
+  sslClient.setClient(&gsmClient);
+
+}
+
+//Time stamp
+String getCurrentTime() {
+  int year;
+  byte month, day, hour, minute, second, hundredths;
+  char timeDate[32];
+  gps.crack_datetime(&year, &month, &day, &hour, &minute, &second, &hundredths, &age);
+  if (age == TinyGPS::GPS_INVALID_AGE)
+    Serial.print("********** ******** ");
+  else {
+    sprintf(timeDate, "%02d_%02d_%02d_%02d:%02d:%02d",
+            day, month, year, hour, minute, second);
+    Serial.print(timeDate);
+  }
+  String currentTime = String(timeDate);
+  return currentTime;
+}
+
+void uploadToFirebase() {
+  if (!taskCompleted) {
+    taskCompleted = true;
+    Serial.print("Uploading picture... ");
+
+    storage.upload(aClient, FirebaseStorage::Parent(STORAGE_BUCKET_ID, "/data/IMG_" + String(getCurrentTime()) + ".jpg"), getFile(media_file), "image/jpg", asyncCB);
+
+    taskCompleted = false;
+  }
+
+}
+
+
+void asyncCB(AsyncResult &aResult)
+{
+    printResult(aResult);
+}
+
+void printResult(AsyncResult &aResult)
+{
+    if (aResult.isEvent())
     {
-        Serial.printf("Uploaded %d%s, Elapsed time %d ms\n", (int)info.progress, "%", info.elapsedTime);
+        Firebase.printf("Event task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.appEvent().message().c_str(), aResult.appEvent().code());
     }
-    else if (info.status == firebase_fcs_upload_status_complete)
+
+    if (aResult.isDebug())
     {
-        Serial.println("Upload completed\n");
-        FileMetaInfo meta = fbdo.metaData();
-        Serial.printf("Name: %s\n", meta.name.c_str());
-        Serial.printf("Bucket: %s\n", meta.bucket.c_str());
-        Serial.printf("contentType: %s\n", meta.contentType.c_str());
-        Serial.printf("Size: %d\n", meta.size);
-        Serial.printf("Generation: %lu\n", meta.generation);
-        Serial.printf("Metageneration: %lu\n", meta.metageneration);
-        Serial.printf("ETag: %s\n", meta.etag.c_str());
-        Serial.printf("CRC32: %s\n", meta.crc32.c_str());
-        Serial.printf("Tokens: %s\n", meta.downloadTokens.c_str());
-        Serial.printf("Download URL: %s\n\n", fbdo.downloadURL().c_str());
+        Firebase.printf("Debug task: %s, msg: %s\n", aResult.uid().c_str(), aResult.debug().c_str());
     }
-    else if (info.status == firebase_fcs_upload_status_error){
-        Serial.printf("Upload failed, %s\n", info.errorMsg.c_str());
+
+    if (aResult.isError())
+    {
+        Firebase.printf("Error task: %s, msg: %s, code: %d\n", aResult.uid().c_str(), aResult.error().message().c_str(), aResult.error().code());
+    }
+
+    if (aResult.downloadProgress())
+    {
+        Firebase.printf("Download task: %s, downloaded %d%s (%d of %d)\n", aResult.uid().c_str(), aResult.downloadInfo().progress, "%", aResult.downloadInfo().downloaded, aResult.downloadInfo().total);
+        if (aResult.downloadInfo().total == aResult.downloadInfo().downloaded)
+        {
+            Firebase.printf("Download task: %s, completed!\n", aResult.uid().c_str());
+        }
+    }
+
+    if (aResult.uploadProgress())
+    {
+        Firebase.printf("Upload task: %s, uploaded %d%s (%d of %d)\n", aResult.uid().c_str(), aResult.uploadInfo().progress, "%", aResult.uploadInfo().uploaded, aResult.uploadInfo().total);
+        if (aResult.uploadInfo().total == aResult.uploadInfo().uploaded)
+        {
+            Firebase.printf("Upload task: %s, completed!\n", aResult.uid().c_str());
+            Serial.print("Download URL: ");
+            Serial.println(aResult.uploadInfo().downloadUrl);
+            String downloadUrl = aResult.uploadInfo().downloadUrl;
+            sendSms(downloadUrl);
+
+        }
+    }
+}
+
+
+void fileCallback(File &file, const char *filename, file_operating_mode mode)
+{
+    // FILE_OPEN_MODE_READ, FILE_OPEN_MODE_WRITE and FILE_OPEN_MODE_APPEND are defined in this library
+    switch (mode)
+    {
+    case file_mode_open_read:
+        file = LittleFS.open(filename, FILE_READ);
+        break;
+    case file_mode_open_write:
+        file = LittleFS.open(filename, FILE_WRITE);
+        break;
+    case file_mode_open_append:
+        file = LittleFS.open(filename, FILE_APPEND);
+        break;
+    case file_mode_remove:
+        LittleFS.remove(filename);
+        break;
+    default:
+        break;
     }
 }
